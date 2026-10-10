@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ColdWatch</title>
+<style>
+:root{--bg:#eef3f6;--ink:#10222e;--mute:#5b6f7c;--ice:#1f6f8b;--card:#fff;--line:#cfdbe3;--warn:#c2410c}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font-family:"Noto Sans JP","Hiragino Sans",system-ui,sans-serif;
+ display:flex;flex-direction:column;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+header{padding:14px 18px;font-weight:700;font-size:20px;display:flex;justify-content:space-between;align-items:center}
+header select{font-size:16px;padding:6px;border:1px solid var(--line);border-radius:8px;background:#fff}
+#log{flex:1;overflow:auto;padding:0 14px 12px}
+.msg{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin:10px 0;font-size:19px;line-height:1.6;white-space:pre-wrap}
+.msg.me{background:var(--ice);color:#fff;border:0;margin-left:36px}
+.steps{font-size:14px;color:var(--mute);margin:6px 4px}
+.steps span{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 10px;margin:2px 4px 2px 0;background:#fff}
+#dock{padding:10px 14px 18px;background:var(--bg);text-align:center}
+#hint{font-size:15px;color:var(--mute);min-height:22px;margin-bottom:8px}
+#mic{width:112px;height:112px;border-radius:50%;border:0;background:var(--ice);color:#fff;font-size:44px;
+ box-shadow:0 0 0 8px rgba(31,111,139,.18)}
+#mic.on{background:var(--warn);box-shadow:0 0 0 14px rgba(194,65,12,.22)}
+#mic:focus-visible{outline:4px solid #000}
+.quick{display:flex;gap:8px;justify-content:center;margin-top:12px;flex-wrap:wrap}
+.quick button{font-size:15px;padding:10px 14px;border-radius:10px;border:1px solid var(--line);background:#fff}
+</style>
+</head>
+<body>
+<header>ColdWatch
+ <select id="lang"><option value="ja-JP">日本語</option><option value="en-US">English</option>
+ <option value="zh-CN">中文</option><option value="vi-VN">Tiếng Việt</option><option value="id-ID">Indonesia</option></select>
+</header>
+<div id="log"></div>
+<div id="dock">
+ <div id="hint">マイクを押して話してください</div>
+ <button id="mic" aria-label="話す">🎙</button>
+ <div class="quick">
+  <button data-q="最新の状態は？">最新の状態</button>
+  <button data-q="先週のHACCP報告書を作って">先週の週報</button>
+  <button data-q="改善提案を出して">改善提案</button>
+  <button id="stop">⏹ 停止</button>
+ </div>
+</div>
+<script>
+const log=document.getElementById('log'),mic=document.getElementById('mic'),hint=document.getElementById('hint'),langSel=document.getElementById('lang');
+let sid=null,rec=null,busy=false;
+const add=(t,c)=>{const d=document.createElement('div');d.className='msg '+(c||'');d.textContent=t;log.appendChild(d);log.scrollTop=log.scrollHeight;return d};
+async function ask(text){
+  if(busy)return;busy=true;add(text,'me');hint.textContent='処理中…';
+  try{
+    const r=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:`[Reply ONLY in language code ${langSel.value}] `+text,session_id:sid})});
+    const j=await r.json();sid=j.session_id;
+    if(j.steps.length){const s=document.createElement('div');s.className='steps';
+      s.innerHTML=j.steps.map(x=>`<span>${x.tool}</span>`).join('');log.appendChild(s)}
+    add(j.answer);speak(j.answer);
+  }catch(e){add('接続できません。電波を確認して、もう一度お試しください。')}
+  busy=false;hint.textContent='マイクを押して話してください';
+}
+function detect(t){
+  if(/[\u3040-\u30ff]/.test(t))return 'ja-JP';
+  if(/[\u4e00-\u9fff]/.test(t))return 'zh-CN';
+  if(/[ăâđêôơưạảấầẫậắằẵặẹẻẽếềễệỉịọỏốồỗộớờỡợụủứừữựỳỵỷỹ]/i.test(t))return 'vi-VN';
+  return /^(id-ID|vi-VN)$/.test(langSel.value)?langSel.value:'en-US';
+}
+function speak(t){if(!('speechSynthesis' in window))return;speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance(t.replace(/[#*|`]/g,''));u.lang=langSel.value;speechSynthesis.speak(u)}
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+mic.onclick=()=>{
+  speechSynthesis.cancel();
+  if(!SR){hint.textContent='このブラウザは音声入力に非対応です(Chrome推奨)';return}
+  if(rec){rec.stop();return}
+  rec=new SR();rec.lang=langSel.value;rec.interimResults=true;
+  mic.classList.add('on');hint.textContent='聞いています…';let fin='';
+  rec.onresult=e=>{fin=[...e.results].map(r=>r[0].transcript).join('');hint.textContent=fin};
+  rec.onend=()=>{mic.classList.remove('on');rec=null;if(fin)ask(fin);else hint.textContent='聞き取れませんでした'};
+  rec.start();
+};
+document.querySelectorAll('.quick button').forEach(b=>b.onclick=()=>ask(b.dataset.q));
+document.getElementById('stop').onclick=()=>speechSynthesis.cancel();
+</script>
+</body>
+</html>

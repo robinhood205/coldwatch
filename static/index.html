@@ -28,17 +28,18 @@ header select{font-size:16px;padding:6px;border:1px solid var(--line);border-rad
 </style>
 </head>
 <body>
-<header>ColdWatch
+<header>ColdWatch<small style="font-weight:400;font-size:13px;color:var(--mute)">過去3ヶ月の実データで分析</small>
  <select id="lang"><option value="ja-JP">日本語</option><option value="en-US">English</option>
  <option value="zh-CN">中文</option><option value="vi-VN">Tiếng Việt</option><option value="id-ID">Indonesia</option></select>
 </header>
 <div id="log"></div>
 <div id="dock">
+ <div id="examples" style="font-size:14px;color:var(--mute);margin-bottom:6px"></div>
  <div id="hint">マイクを押して話してください</div>
  <button id="mic" aria-label="話す">🎙</button>
  <div class="quick">
-  <button data-q="最新の状態は？">最新の状態</button>
-  <button data-q="先週のHACCP報告書を作って">先週の週報</button>
+  <button data-q="全ての機器の最新状態は？">最新状態(全機器)</button>
+  <button data-q="今日までの温度管理の結果は？">今日までの結果</button>
   <button data-q="改善提案を出して">改善提案</button>
   <button id="stop">⏹ 停止</button>
  </div>
@@ -78,7 +79,15 @@ mic.onclick=()=>{
   rec.start();
 };
 document.querySelectorAll('.quick button').forEach(b=>b.onclick=()=>ask(b.dataset.q));
-document.getElementById('stop').onclick=()=>speechSynthesis.cancel();
+const st=document.getElementById('stop'); if(st) st.onclick=()=>speechSynthesis.cancel();
+const EX={
+ 'ja-JP':'例:「最新の状態は？」「今日までの結果は？」「改善提案」',
+ 'en-US':'e.g. "Latest status?" "Results up to today?" "Suggest improvements"',
+ 'zh-CN':'例:「最新状态？」「到今天为止的结果？」「改善建议」',
+ 'vi-VN':'VD: "Tình trạng mới nhất?" "Kết quả đến hôm nay?" "Đề xuất cải thiện"',
+ 'id-ID':'Contoh: "Status terbaru?" "Hasil sampai hari ini?" "Saran perbaikan"'};
+const showEx=()=>{const e=document.getElementById('examples'); if(e) e.textContent=EX[langSel.value]||''};
+langSel.addEventListener('change',showEx); showEx();
 </script>
 </body>
 </html>

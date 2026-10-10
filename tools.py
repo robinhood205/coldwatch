@@ -28,25 +28,29 @@ def get_current_status(hours: int = 3) -> dict:
         hours: 直近何時間を見るか(既定3)。
     """
     sql = f"""
-    WITH latest AS (
+    WITH max_ts AS (
+      SELECT MAX(timestamp) AS max_timestamp FROM {TABLE}
+    ), latest AS (
       SELECT * EXCEPT(rn) FROM (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY device_name ORDER BY timestamp DESC) rn
-        FROM {TABLE}) WHERE rn = 1),
-    recent AS (
+        FROM {TABLE}) WHERE rn = 1
+    ), recent AS (
       SELECT device_name, MIN(temperature) tmin, MAX(temperature) tmax, AVG(temperature) tavg
-      FROM {TABLE}
-      WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @h HOUR)
-      GROUP BY device_name),
-    baseline AS (
+      FROM {TABLE}, max_ts
+      WHERE timestamp >= TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL @h HOUR)
+      GROUP BY device_name
+    ), baseline AS (
       SELECT device_name, AVG(temperature) bavg, STDDEV(temperature) bstd
-      FROM {TABLE}
-      GROUP BY device_name)
+      FROM {TABLE}, max_ts
+      WHERE timestamp >= TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL 30 DAY)
+      GROUP BY device_name
+    )
     SELECT l.device_name, l.timestamp, l.temperature, l.humidity,
-           TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), l.timestamp, MINUTE) AS minutes_ago,
+           TIMESTAMP_DIFF(max_ts.max_timestamp, l.timestamp, MINUTE) AS minutes_ago,
            r.tmin, r.tmax, ROUND(r.tavg,2) tavg,
            b.bavg, b.bstd
     FROM latest l LEFT JOIN recent r USING(device_name)
-                  LEFT JOIN baseline b USING(device_name)"""
+                  LEFT JOIN baseline b USING(device_name), max_ts"""
     rows = _run(sql, [bigquery.ScalarQueryParameter("h", "INT64", hours)])
     for r in rows:
         r["timestamp"] = r["timestamp"].astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")
@@ -67,26 +71,32 @@ def get_current_status(hours: int = 3) -> dict:
 
 
 def generate_haccp_weekly_report(days: int = 7) -> dict:
-    """指定日数間のHACCPコンプライアンス集計(判定はコードで実施)。
+    """指定日数間の温度管理の集計(HACCP記録用)。
     Args:
         days: 直近何日間を見るか(既定7)。
     """
     sql = f"""
+    WITH max_ts AS (
+      SELECT MAX(timestamp) AS max_timestamp FROM {TABLE}
+    )
     SELECT device_name,
            COUNT(*) n, ROUND(MIN(temperature),1) tmin, ROUND(MAX(temperature),1) tmax,
            ROUND(AVG(temperature),1) tavg, ROUND(AVG(humidity),1) havg,
            MIN(voltage) vmin, MIN(signal_strength) smin
-    FROM {TABLE}
-    WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @d DAY)
-      AND timestamp <  CURRENT_TIMESTAMP()
+    FROM {TABLE}, max_ts
+    WHERE timestamp >= TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL @d DAY)
+      AND timestamp <  max_ts.max_timestamp
     GROUP BY device_name"""
     rows = _run(sql, [bigquery.ScalarQueryParameter("d", "INT64", days)])
     # 超過回数(15分×回数=超過分)
     ex_sql = f"""
+    WITH max_ts AS (
+      SELECT MAX(timestamp) AS max_timestamp FROM {TABLE}
+    )
     SELECT device_name, COUNTIF(temperature > @lim) over_n
-    FROM {TABLE}
-    WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @d DAY)
-      AND timestamp <  CURRENT_TIMESTAMP()
+    FROM {TABLE}, max_ts
+    WHERE timestamp >= TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL @d DAY)
+      AND timestamp <  max_ts.max_timestamp
       AND (CONTAINS_SUBSTR(device_name,'冷凍') = (@lim < 0))
     GROUP BY device_name"""
     over = {}
@@ -97,15 +107,17 @@ def generate_haccp_weekly_report(days: int = 7) -> dict:
 
     # New: Calculate average over_limit_count for the past 90 days and multiply by `days`
     over_normal_sql = f"""
-    WITH daily_over AS (
+    WITH max_ts AS (
+      SELECT MAX(timestamp) AS max_timestamp FROM {TABLE}
+    ), daily_over AS (
         SELECT
             device_name,
             DATE(timestamp, 'Asia/Tokyo') AS record_date,
             COUNTIF(temperature > @fridge_lim AND CONTAINS_SUBSTR(device_name, '冷凍') = FALSE) AS over_fridge,
             COUNTIF(temperature > @freezer_lim AND CONTAINS_SUBSTR(device_name, '冷凍') = TRUE) AS over_freezer
-        FROM {TABLE}
-        WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY)
-          AND timestamp < CURRENT_TIMESTAMP()
+        FROM {TABLE}, max_ts
+        WHERE timestamp >= TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL 30 DAY)
+          AND timestamp < max_ts.max_timestamp
         GROUP BY device_name, record_date
     )
     SELECT
@@ -131,17 +143,20 @@ def generate_haccp_weekly_report(days: int = 7) -> dict:
     return {"days": days, "expected_points": expected, "devices": rows}
 
 
-def get_trend_for_improvement(weeks: int = 12) -> dict:
+def get_trend_for_improvement(weeks: int = 5) -> dict:
     """機器ごとの週次推移(平均・ばらつき・電圧・電波)。老化/故障予兆の分析用。
     Args:
-        weeks: 何週間分(既定12)。
+        weeks: 何週間分(既定5)。
     """
     sql = f"""
+    WITH max_ts AS (
+      SELECT MAX(timestamp) AS max_timestamp FROM {TABLE}
+    )
     SELECT device_name, DATE_TRUNC(DATE(timestamp,'Asia/Tokyo'), WEEK(MONDAY)) week,
            ROUND(AVG(temperature),2) tavg, ROUND(STDDEV(temperature),2) tstd,
            ROUND(MAX(temperature),1) tmax, MIN(voltage) vmin, ROUND(AVG(signal_strength),0) sig
-    FROM {TABLE}
-    WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @d DAY)
+    FROM {TABLE}, max_ts
+    WHERE timestamp >= TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL @d DAY)
     GROUP BY device_name, week ORDER BY device_name, week"""
     rows = _run(sql, [bigquery.ScalarQueryParameter("d", "INT64", weeks * 7)])
     for r in rows:
@@ -180,17 +195,22 @@ def get_trend_for_improvement(weeks: int = 12) -> dict:
             })
 
     # New: Recent 7 days vs previous baseline (past 90 days excluding recent 7 days)
+    max_timestamp_query = f"SELECT MAX(timestamp) AS max_timestamp FROM {TABLE}"
+    max_timestamp_result = _run(max_timestamp_query)
+    max_timestamp_val = max_timestamp_result[0]["max_timestamp"] if max_timestamp_result else datetime.now(timezone(timedelta(hours=9)))
+
     recent_vs_baseline_sql = f"""
-    WITH
-    recent_data AS (
+    WITH max_ts AS (
+      SELECT MAX(timestamp) AS max_timestamp FROM {TABLE}
+    ), recent_data AS (
       SELECT
         device_name,
         AVG(temperature) AS recent_tavg,
         STDDEV(temperature) AS recent_tstd,
         MIN(voltage) AS recent_vmin
-      FROM {TABLE}
-      WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
-        AND timestamp < CURRENT_TIMESTAMP()
+      FROM {TABLE}, max_ts
+      WHERE timestamp >= TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL 7 DAY)
+        AND timestamp < max_ts.max_timestamp
       GROUP BY device_name
     ),
     baseline_data AS (
@@ -199,9 +219,9 @@ def get_trend_for_improvement(weeks: int = 12) -> dict:
         AVG(temperature) AS baseline_tavg,
         STDDEV(temperature) AS baseline_tstd,
         MIN(voltage) AS baseline_vmin
-      FROM {TABLE}
-      WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY)
-        AND timestamp < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+      FROM {TABLE}, max_ts
+      WHERE timestamp >= TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL 30 DAY)
+        AND timestamp < TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL 7 DAY)
       GROUP BY device_name
     )
     SELECT
@@ -232,8 +252,8 @@ def get_trend_for_improvement(weeks: int = 12) -> dict:
 
         recent_vs_baseline.append({
             "device_name": r["device_name"],
-            "recent_from": (datetime.now(timezone(timedelta(hours=9))) - timedelta(days=7)).strftime("%Y-%m-%d"),
-            "recent_to": datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d"),
+            "recent_from": (max_timestamp_val - timedelta(days=7)).astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d"),
+            "recent_to": max_timestamp_val.astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d"),
             "tavg_change": tavg_change,
             "tstd_change": tstd_change,
             "voltage_change": voltage_change

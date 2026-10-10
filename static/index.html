@@ -28,7 +28,7 @@ header select{font-size:16px;padding:6px;border:1px solid var(--line);border-rad
 </style>
 </head>
 <body>
-<header>ColdWatch<small style="font-weight:400;font-size:13px;color:var(--mute)">過去3ヶ月の実データで分析</small>
+<header>ColdWatch<small style="font-weight:400;font-size:13px;color:var(--mute)">過去1ヶ月の実データを基準に分析</small>
  <select id="lang"><option value="ja-JP">日本語</option><option value="en-US">English</option>
  <option value="zh-CN">中文</option><option value="vi-VN">Tiếng Việt</option><option value="id-ID">Indonesia</option></select>
 </header>
@@ -38,8 +38,8 @@ header select{font-size:16px;padding:6px;border:1px solid var(--line);border-rad
  <div id="hint">マイクを押して話してください</div>
  <button id="mic" aria-label="話す">🎙</button>
  <div class="quick">
-  <button data-q="全ての機器の最新状態は？">最新状態(全機器)</button>
-  <button data-q="今日までの温度管理の結果は？">今日までの結果</button>
+  <button data-q="全ての機器の今の状態は？">今の状態(全機器)</button>
+  <button data-q="今日の温度管理の状況は？">今日の状況</button>
   <button data-q="改善提案を出して">改善提案</button>
   <button id="stop">⏹ 停止</button>
  </div>
@@ -81,11 +81,11 @@ mic.onclick=()=>{
 document.querySelectorAll('.quick button').forEach(b=>b.onclick=()=>ask(b.dataset.q));
 const st=document.getElementById('stop'); if(st) st.onclick=()=>speechSynthesis.cancel();
 const EX={
- 'ja-JP':'例:「最新の状態は？」「今日までの結果は？」「改善提案」',
- 'en-US':'e.g. "Latest status?" "Results up to today?" "Suggest improvements"',
- 'zh-CN':'例:「最新状态？」「到今天为止的结果？」「改善建议」',
- 'vi-VN':'VD: "Tình trạng mới nhất?" "Kết quả đến hôm nay?" "Đề xuất cải thiện"',
- 'id-ID':'Contoh: "Status terbaru?" "Hasil sampai hari ini?" "Saran perbaikan"'};
+ 'ja-JP':'例:「今の状態は？」「今日の状況は？」「改善提案」',
+ 'en-US':'e.g. "Current status?" "Today\'s situation?" "Suggest improvements"',
+ 'zh-CN':'例:「目前状态？」「今日情况？」「改善建议」',
+ 'vi-VN':'VD: "Tình trạng hiện tại?" "Tình hình hôm nay?" "Đề xuất cải thiện"',
+ 'id-ID':'Contoh: "Status saat ini?" "Situasi hari ini?" "Saran perbaikan"'};
 const showEx=()=>{const e=document.getElementById('examples'); if(e) e.textContent=EX[langSel.value]||''};
 langSel.addEventListener('change',showEx); showEx();
 </script>

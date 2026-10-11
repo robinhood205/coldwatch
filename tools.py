@@ -8,14 +8,71 @@ TABLE = f"`{PROJECT}.haccp_monitoring.records`"
 bq = bigquery.Client(project=PROJECT)
 
 # HACCP基準(例)。社内基準に合わせて変更。名前に「冷凍」→冷凍、それ以外→冷蔵
-LIMIT_FREEZER_MAX = -15.0
-LIMIT_FRIDGE_MAX = 10.0
+
+DEFAULTS = {"freezer": {"limit_max": -15.0, "min_duration_min": 30}, "fridge": {"limit_max": 10.0, "min_duration_min": 30}}
+DEVICE_CONFIG = {}  # 機器ごとの上書き。例: "冷凍庫1": {"limit_max": -18.0, "min_duration_min": 30}
 STALE_MIN = 10**9  # 15分間隔×2回欠測
 
+def _cfg(device_name: str) -> dict:
+    base_type = "freezer" if "冷凍" in (device_name or "") else "fridge"
+    config = DEFAULTS[base_type].copy()
+    config.update(DEVICE_CONFIG.get(device_name, {}))
+    return config
 
-def _limit(device_name: str) -> float:
-    return LIMIT_FREEZER_MAX if "冷凍" in (device_name or "") else LIMIT_FRIDGE_MAX
+def _excursions(points, limit, min_minutes):
+    """
+    points: list of (timestamp, temperature) tuples, sorted by timestamp.
+    limit: temperature limit for excursion.
+    min_minutes: minimum duration for an excursion to be considered an event.
+    """
+    excursion_events = []
+    current_excursion = []
 
+    # Calculate median interval for more accurate duration calculation
+    intervals = []
+    for i in range(1, len(points)):
+        diff = (points[i][0] - points[i-1][0]).total_seconds() / 60
+        if diff > 0: # Avoid zero or negative intervals
+            intervals.append(diff)
+    median_interval = sorted(intervals)[len(intervals) // 2] if intervals else 15
+
+    for ts, temp in points:
+        if temp is not None and temp > limit:
+            current_excursion.append({"timestamp": ts, "temperature": temp})
+        else:
+            if current_excursion:
+                start_ts = current_excursion[0]["timestamp"]
+                end_ts = current_excursion[-1]["timestamp"]
+                duration_minutes = (end_ts - start_ts).total_seconds() / 60 + median_interval
+
+                if duration_minutes >= min_minutes:
+                    max_temp = max(p["temperature"] for p in current_excursion)
+
+                    excursion_events.append({
+                        "start": start_ts.astimezone(timezone(timedelta(hours=9))).strftime("%m-%d %H:%M"),
+                        "end": end_ts.astimezone(timezone(timedelta(hours=9))).strftime("%m-%d %H:%M"),
+                        "minutes": round(duration_minutes),
+                        "max_temp": max_temp
+                    })
+                current_excursion = []
+
+    # Check for an excursion that extends to the end of the data
+    if current_excursion:
+        start_ts = current_excursion[0]["timestamp"]
+        end_ts = current_excursion[-1]["timestamp"]
+        duration_minutes = (end_ts - start_ts).total_seconds() / 60 + median_interval
+
+        if duration_minutes >= min_minutes:
+            max_temp = max(p["temperature"] for p in current_excursion)
+
+            excursion_events.append({
+                "start": start_ts.astimezone(timezone(timedelta(hours=9))).strftime("%m-%d %H:%M"),
+                "end": end_ts.astimezone(timezone(timedelta(hours=9))).strftime("%m-%d %H:%M"),
+                "minutes": round(duration_minutes),
+                "max_temp": max_temp
+            })
+
+    return excursion_events
 
 def _run(sql, params=None):
     cfg = bigquery.QueryJobConfig(query_parameters=params or [])
@@ -52,10 +109,71 @@ def get_current_status(hours: int = 3) -> dict:
     FROM latest l LEFT JOIN recent r USING(device_name)
                   LEFT JOIN baseline b USING(device_name), max_ts"""
     rows = _run(sql, [bigquery.ScalarQueryParameter("h", "INT64", hours)])
+
+    # Fetch recent temperature points for excursion check
+    recent_temp_sql = f"""
+    WITH max_ts AS (
+        SELECT MAX(timestamp) AS max_timestamp FROM {TABLE}
+    )
+    SELECT device_name, timestamp, temperature
+    FROM {TABLE}, max_ts
+    WHERE timestamp >= TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL @check_hours HOUR)
+      AND timestamp <= max_ts.max_timestamp
+    ORDER BY device_name, timestamp ASC
+    """
+    # Use hours + 3 as a buffer for continuous check. Max 3 hours + 3 = 6 hours.
+    recent_temp_data = _run(recent_temp_sql, [bigquery.ScalarQueryParameter("check_hours", "INT64", hours + 3)])
+
+    device_recent_points = {}
+    for pt in recent_temp_data:
+        device_recent_points.setdefault(pt["device_name"], []).append((pt["timestamp"], pt["temperature"]))
     for r in rows:
         r["timestamp"] = r["timestamp"].astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")
-        r["limit_max"] = _limit(r["device_name"])
-        r["over_limit"] = r["temperature"] is not None and r["temperature"] > r["limit_max"]
+        cfg = _cfg(r["device_name"])
+        r["limit_max"] = cfg["limit_max"]
+        r["min_duration_min"] = cfg["min_duration_min"]
+
+        # Check for over_now and continuous over_limit
+        r["over_now"] = r["temperature"] is not None and r["temperature"] > r["limit_max"]
+
+        device_points = device_recent_points.get(r["device_name"], [])
+        if device_points:
+            # Calculate median interval for more accurate duration calculation
+            intervals = []
+            for i in range(1, len(device_points)):
+                diff = (device_points[i][0] - device_points[i-1][0]).total_seconds() / 60
+                if diff > 0:  # Avoid zero or negative intervals
+                    intervals.append(diff)
+            median_interval = sorted(intervals)[len(intervals) // 2] if intervals else 15
+
+            # Only consider points leading up to the very latest
+            latest_ts = device_points[-1][0]
+            consecutive_excursion_points = []
+
+            # Iterate backwards from the latest point
+            for i in range(len(device_points) - 1, -1, -1):
+                ts, temp = device_points[i]
+                if temp is not None and temp > r["limit_max"]:
+                    if not consecutive_excursion_points or \
+                       (consecutive_excursion_points[0][0] - ts).total_seconds() / 60 < (len(consecutive_excursion_points) + 1) * median_interval: # Check if it's truly consecutive considering median_interval
+                        consecutive_excursion_points.insert(0, (ts, temp))
+                    else:
+                        break
+                else:
+                    break
+
+            if consecutive_excursion_points:
+                start_consecutive_ts = consecutive_excursion_points[0][0]
+                end_consecutive_ts = consecutive_excursion_points[-1][0]
+                r["over_minutes_now"] = round((end_consecutive_ts - start_consecutive_ts).total_seconds() / 60 + median_interval)
+            else:
+                r["over_minutes_now"] = 0
+
+            r["over_limit"] = r["over_minutes_now"] >= r["min_duration_min"]
+        else:
+            r["over_minutes_now"] = 0
+            r["over_limit"] = False
+
         r["data_stale"] = r["minutes_ago"] > STALE_MIN
 
         # New: Anomaly detection based on historical baseline
@@ -88,59 +206,86 @@ def generate_haccp_weekly_report(days: int = 7) -> dict:
       AND timestamp <  max_ts.max_timestamp
     GROUP BY device_name"""
     rows = _run(sql, [bigquery.ScalarQueryParameter("d", "INT64", days)])
-    # 超過回数(15分×回数=超過分)
-    ex_sql = f"""
-    WITH max_ts AS (
-      SELECT MAX(timestamp) AS max_timestamp FROM {TABLE}
-    )
-    SELECT device_name, COUNTIF(temperature > @lim) over_n
-    FROM {TABLE}, max_ts
-    WHERE timestamp >= TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL @d DAY)
-      AND timestamp <  max_ts.max_timestamp
-      AND (CONTAINS_SUBSTR(device_name,'冷凍') = (@lim < 0))
-    GROUP BY device_name"""
-    over = {}
-    for lim in (LIMIT_FREEZER_MAX, LIMIT_FRIDGE_MAX):
-        for r in _run(ex_sql, [bigquery.ScalarQueryParameter("lim", "FLOAT64", lim),
-                               bigquery.ScalarQueryParameter("d", "INT64", days)]):
-            over[r["device_name"]] = r["over_n"]
 
-    # New: Calculate average over_limit_count for the past 90 days and multiply by `days`
-    over_normal_sql = f"""
+    max_timestamp_query = f"SELECT MAX(timestamp) AS max_timestamp FROM {TABLE}"
+    max_timestamp_result = _run(max_timestamp_query)
+    max_timestamp_val = max_timestamp_result[0]["max_timestamp"] if max_timestamp_result else datetime.now(timezone.utc)
+
+    # Raw temperature points for excursion analysis
+    full_data_sql = f"""
     WITH max_ts AS (
-      SELECT MAX(timestamp) AS max_timestamp FROM {TABLE}
-    ), daily_over AS (
-        SELECT
-            device_name,
-            DATE(timestamp, 'Asia/Tokyo') AS record_date,
-            COUNTIF(temperature > @fridge_lim AND CONTAINS_SUBSTR(device_name, '冷凍') = FALSE) AS over_fridge,
-            COUNTIF(temperature > @freezer_lim AND CONTAINS_SUBSTR(device_name, '冷凍') = TRUE) AS over_freezer
-        FROM {TABLE}, max_ts
-        WHERE timestamp >= TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL 30 DAY)
-          AND timestamp < max_ts.max_timestamp
-        GROUP BY device_name, record_date
+        SELECT MAX(timestamp) AS max_timestamp FROM {TABLE}
     )
-    SELECT
-        device_name,
-        ROUND(AVG(CASE WHEN CONTAINS_SUBSTR(device_name, '冷凍') THEN over_freezer ELSE over_fridge END) * @d, 1) AS avg_over_normal
-    FROM daily_over
-    GROUP BY device_name
+    SELECT device_name, timestamp, temperature
+    FROM {TABLE}, max_ts
+    WHERE timestamp >= TIMESTAMP_SUB(max_ts.max_timestamp, INTERVAL @days_plus_30 DAY)
+      AND timestamp <= max_ts.max_timestamp
+    ORDER BY device_name, timestamp ASC
     """
-    over_normal_data = _run(over_normal_sql, [
-        bigquery.ScalarQueryParameter("fridge_lim", "FLOAT64", LIMIT_FRIDGE_MAX),
-        bigquery.ScalarQueryParameter("freezer_lim", "FLOAT64", LIMIT_FREEZER_MAX),
-        bigquery.ScalarQueryParameter("d", "INT64", days)
-    ])
-    over_normal_map = {r["device_name"]: r["avg_over_normal"] for r in over_normal_data}
+    # Fetch data for `days` + 30 days for baseline calculation
+    full_temp_data = _run(full_data_sql, [bigquery.ScalarQueryParameter("days_plus_30", "INT64", days + 30)])
+
+    device_all_points = {}
+    for pt in full_temp_data:
+        device_all_points.setdefault(pt["device_name"], []).append((pt["timestamp"], pt["temperature"]))
+
     expected = days * 96  # 15分間隔
+
     for r in rows:
-        r["limit_max"] = _limit(r["device_name"])
-        r["over_limit_count"] = over.get(r["device_name"], 0)
-        r["over_limit_minutes"] = r["over_limit_count"] * 15
+        device_name = r["device_name"]
+        cfg = _cfg(device_name)
+        limit_max = cfg["limit_max"]
+        min_duration_min = cfg["min_duration_min"]
+
+        r["limit_max"] = limit_max
+        r["min_duration_min"] = min_duration_min
+
+        all_points_for_device = device_all_points.get(device_name, [])
+
+        # Filter points for the current `days` period
+        current_period_points = [
+            (ts, temp) for ts, temp in all_points_for_device
+            if (max_timestamp_val - ts).days < days
+        ]
+
+        # Calculate raw over points (just for reference, not for compliance)
+        r["raw_over_points"] = sum(1 for ts, temp in current_period_points if temp is not None and temp > limit_max)
+
+        # Calculate excursions for the current period
+        excursions = _excursions(current_period_points, limit_max, min_duration_min)
+        excursions.sort(key=lambda x: x["minutes"], reverse=True)
+
+        r["over_limit_count"] = len(excursions)
+        r["over_limit_minutes"] = sum(e["minutes"] for e in excursions)
+        r["excursions"] = excursions[:3] # Top 3 longest excursions
+
+        # Calculate over_normal (average daily excursions over the past 30 days)
+        baseline_period_points = [
+            (ts, temp) for ts, temp in all_points_for_device
+            if (max_timestamp_val - ts).days >= days and (max_timestamp_val - ts).days < (days + 30)
+        ]
+        baseline_excursions = _excursions(baseline_period_points, limit_max, min_duration_min)
+        avg_daily_excursions_in_baseline = len(baseline_excursions) / 30 if baseline_excursions else 0
+        r["over_normal"] = round(avg_daily_excursions_in_baseline * days, 1)
+
         r["missing_count"] = max(expected - r["n"], 0)
-        r["compliant"] = r["over_limit_count"] == 0 and r["missing_count"] <= expected * 0.05
-        r["over_normal"] = over_normal_map.get(r["device_name"], 0.0)
+        r["compliant"] = r["over_limit_count"] == 0 and (r["missing_count"] / expected) <= 0.10 # 10% missing allowed
     return {"days": days, "expected_points": expected, "devices": rows}
+
+def get_data_range() -> dict:
+    """テーブル全体のデータ期間(最小・最大timestamp)を返す。"""
+    sql = f"""
+    SELECT
+      FORMAT_TIMESTAMP('%Y/%m/%d %H:%M', GREATEST(TIMESTAMP_SUB(MAX(timestamp), INTERVAL 30 DAY), MIN(timestamp)), 'Asia/Tokyo') AS from_timestamp,
+      FORMAT_TIMESTAMP('%Y/%m/%d %H:%M', MAX(timestamp), 'Asia/Tokyo') AS to_timestamp
+    FROM {TABLE}
+    """
+    result = _run(sql)
+    if result and result[0]["from_timestamp"] and result[0]["to_timestamp"]:
+        return {"from": result[0]["from_timestamp"], "to": result[0]["to_timestamp"]}
+    return {"from": "N/A", "to": "N/A"}
+
+
 
 
 def get_trend_for_improvement(weeks: int = 5) -> dict:

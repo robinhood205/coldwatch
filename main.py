@@ -30,12 +30,16 @@ async def ask(body: Ask):
         for fc in ev.get_function_calls():  # 可観測性: 実行ステップを返す
             steps.append({"tool": fc.name, "args": dict(fc.args or {})})
         if ev.is_final_response() and ev.content and ev.content.parts:
-            answer = "".join(p.text or "" for p in ev.content.parts)
+            answer = "".join(p.text or "" for p in ev.content.parts if not getattr(p, "thought", False))
     return {"session_id": sid, "steps": steps, "answer": answer}
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+@app.get("/api/data_range")
+async def data_range():
+    import tools
+    return tools.get_data_range()
 
 @app.get("/")
 def index():

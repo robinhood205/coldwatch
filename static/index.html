@@ -57,7 +57,7 @@ async function ask(text){
     const j=await r.json();sid=j.session_id;
     if(j.steps.length){const s=document.createElement('div');s.className='steps';
       s.innerHTML=j.steps.map(x=>`<span>${x.tool}</span>`).join('');log.appendChild(s)}
-    add(j.answer);speak(j.answer);
+    const a=j.answer.replace(/\*\*/g,'').replace(/^[ \t]*\*[ \t]+/gm,'・');add(a);speak(a);
   }catch(e){add('接続できません。電波を確認して、もう一度お試しください。')}
   busy=false;hint.textContent='マイクを押して話してください';
 }

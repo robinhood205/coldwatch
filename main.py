@@ -1,4 +1,5 @@
 import uuid
+import re
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -31,6 +32,7 @@ async def ask(body: Ask):
             steps.append({"tool": fc.name, "args": dict(fc.args or {})})
         if ev.is_final_response() and ev.content and ev.content.parts:
             answer = "".join(p.text or "" for p in ev.content.parts if not getattr(p, "thought", False))
+            answer = re.sub(r"^\s*\[Reply ONLY in language code[^\]]*\]\s*", "", answer)
     return {"session_id": sid, "steps": steps, "answer": answer}
 
 
